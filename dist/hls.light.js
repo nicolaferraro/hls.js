@@ -7,7 +7,7 @@
 		exports["Hls"] = factory();
 	else
 		root["Hls"] = factory();
-})(this, function() {
+})(typeof self !== 'undefined' ? self : this, function() {
 return /******/ (function(modules) { // webpackBootstrap
 /******/ 	// The module cache
 /******/ 	var installedModules = {};
@@ -6354,7 +6354,7 @@ var LEVEL_PLAYLIST_REGEX_FAST = new RegExp([/#EXTINF:\s*(\d*(?:\.\d+)?)(?:,(.*)\
 /|#.*/.source // All other non-segment oriented tags will match with all groups empty
 ].join(''), 'g');
 
-var LEVEL_PLAYLIST_REGEX_SLOW = /(?:(?:#(EXTM3U))|(?:#EXT-X-(PLAYLIST-TYPE):(.+))|(?:#EXT-X-(MEDIA-SEQUENCE): *(\d+))|(?:#EXT-X-(TARGETDURATION): *(\d+))|(?:#EXT-X-(KEY):(.+))|(?:#EXT-X-(START):(.+))|(?:#EXT-X-(ENDLIST))|(?:#EXT-X-(DISCONTINUITY-SEQ)UENCE:(\d+))|(?:#EXT-X-(DIS)CONTINUITY))|(?:#EXT-X-(VERSION):(\d+))|(?:#EXT-X-(MAP):(.+))|(?:(#)(.*):(.*))|(?:(#)(.*))(?:.*)\r?\n?/;
+var LEVEL_PLAYLIST_REGEX_SLOW = /(?:(?:#(EXTM3U))|(?:#EXT-X-(PLAYLIST-TYPE):(.+))|(?:#EXT-X-(MEDIA-SEQUENCE): *(\d+))|(?:#EXT-X-(TARGETDURATION): *(\d+))|(?:#EXT-X-(KEY):(.+))|(?:#EXT-X-(START):(.+))|(?:#EXT-X-(ENDLIST))|(?:#EXT-X-(DISCONTINUITY-SEQ)UENCE:(\d+))|(?:#EXT-X-(DIS)CONTINUITY))|(?:#EXT-X-(VERSION):(\d+))|(?:#EXT-X-(MAP):(.+))|(?:(#)([^:]*):(.*))|(?:(#)(.*))(?:.*)\r?\n?/;
 
 var MP4_REGEX_SUFFIX = /\.(mp4|m4s|m4v|m4a)$/i;
 
@@ -7340,24 +7340,26 @@ var fragment_loader_FragmentLoader = function (_EventHandler) {
   FragmentLoader.prototype.loaderror = function loaderror(response, context) {
     var networkDetails = arguments.length > 2 && arguments[2] !== undefined ? arguments[2] : null;
 
-    var loader = context.loader;
+    var frag = context.frag;
+    var loader = frag.loader;
     if (loader) {
       loader.abort();
     }
 
-    this.loaders[context.type] = undefined;
+    this.loaders[frag.type] = undefined;
     this.hls.trigger(events["a" /* default */].ERROR, { type: errors["b" /* ErrorTypes */].NETWORK_ERROR, details: errors["a" /* ErrorDetails */].FRAG_LOAD_ERROR, fatal: false, frag: context.frag, response: response, networkDetails: networkDetails });
   };
 
   FragmentLoader.prototype.loadtimeout = function loadtimeout(stats, context) {
     var networkDetails = arguments.length > 2 && arguments[2] !== undefined ? arguments[2] : null;
 
-    var loader = context.loader;
+    var frag = context.frag;
+    var loader = frag.loader;
     if (loader) {
       loader.abort();
     }
 
-    this.loaders[context.type] = undefined;
+    this.loaders[frag.type] = undefined;
     this.hls.trigger(events["a" /* default */].ERROR, { type: errors["b" /* ErrorTypes */].NETWORK_ERROR, details: errors["a" /* ErrorDetails */].FRAG_LOAD_TIMEOUT, fatal: false, frag: context.frag, networkDetails: networkDetails });
   };
 
@@ -8786,6 +8788,205 @@ function fragmentWithinToleranceTest() {
 
   return 0;
 }
+// CONCATENATED MODULE: ./src/controller/gap-controller.js
+function gap_controller__classCallCheck(instance, Constructor) { if (!(instance instanceof Constructor)) { throw new TypeError("Cannot call a class as a function"); } }
+
+
+
+
+
+
+var stallDebounceInterval = 1000;
+var jumpThreshold = 0.5; // tolerance needed as some browsers stalls playback before reaching buffered range end
+
+var gap_controller_GapController = function () {
+  function GapController(config, media, fragmentTracker, hls) {
+    gap_controller__classCallCheck(this, GapController);
+
+    this.config = config;
+    this.media = media;
+    this.fragmentTracker = fragmentTracker;
+    this.hls = hls;
+    this.stallReported = false;
+  }
+
+  /**
+   * Checks if the playhead is stuck within a gap, and if so, attempts to free it.
+   * A gap is an unbuffered range between two buffered ranges (or the start and the first buffered range).
+   * @param lastCurrentTime
+   * @param buffered
+   */
+
+
+  GapController.prototype.poll = function poll(lastCurrentTime, buffered) {
+    var config = this.config,
+        media = this.media;
+
+    var currentTime = media.currentTime;
+    var tnow = window.performance.now();
+
+    if (currentTime !== lastCurrentTime) {
+      // The playhead is now moving, but was previously stalled
+      if (this.stallReported) {
+        logger["b" /* logger */].warn('playback not stuck anymore @' + currentTime + ', after ' + Math.round(tnow - this.stalled) + 'ms');
+        this.stallReported = false;
+      }
+      this.stalled = null;
+      this.nudgeRetry = 0;
+      return;
+    }
+
+    if (media.ended || !media.buffered.length || media.readyState > 2) {
+      return;
+    }
+
+    if (media.seeking && BufferHelper.isBuffered(media, currentTime)) {
+      return;
+    }
+
+    // The playhead isn't moving but it should be
+    // Allow some slack time to for small stalls to resolve themselves
+    var stalledDuration = tnow - this.stalled;
+    var bufferInfo = BufferHelper.bufferInfo(media, currentTime, config.maxBufferHole);
+    if (!this.stalled) {
+      this.stalled = tnow;
+      return;
+    } else if (stalledDuration >= stallDebounceInterval) {
+      // Report stalling after trying to fix
+      this._reportStall(bufferInfo.len);
+    }
+
+    this._tryFixBufferStall(bufferInfo, stalledDuration);
+  };
+
+  /**
+   * Detects and attempts to fix known buffer stalling issues.
+   * @param bufferInfo - The properties of the current buffer.
+   * @param stalledDuration - The amount of time Hls.js has been stalling for.
+   * @private
+   */
+
+
+  GapController.prototype._tryFixBufferStall = function _tryFixBufferStall(bufferInfo, stalledDuration) {
+    var config = this.config,
+        fragmentTracker = this.fragmentTracker,
+        media = this.media;
+
+    var currentTime = media.currentTime;
+
+    var partial = fragmentTracker.getPartialFragment(currentTime);
+    if (partial) {
+      // Try to skip over the buffer hole caused by a partial fragment
+      // This method isn't limited by the size of the gap between buffered ranges
+      this._trySkipBufferHole(partial);
+    }
+
+    if (bufferInfo.len > jumpThreshold && stalledDuration > config.highBufferWatchdogPeriod * 1000) {
+      // Try to nudge currentTime over a buffer hole if we've been stalling for the configured amount of seconds
+      // We only try to jump the hole if it's under the configured size
+      // Reset stalled so to rearm watchdog timer
+      this.stalled = null;
+      this._tryNudgeBuffer();
+    }
+  };
+
+  /**
+   * Triggers a BUFFER_STALLED_ERROR event, but only once per stall period.
+   * @param bufferLen - The playhead distance from the end of the current buffer segment.
+   * @private
+   */
+
+
+  GapController.prototype._reportStall = function _reportStall(bufferLen) {
+    var hls = this.hls,
+        media = this.media,
+        stallReported = this.stallReported;
+
+    if (!stallReported) {
+      // Report stalled error once
+      this.stallReported = true;
+      logger["b" /* logger */].warn('Playback stalling at @' + media.currentTime + ' due to low buffer');
+      hls.trigger(events["a" /* default */].ERROR, {
+        type: errors["b" /* ErrorTypes */].MEDIA_ERROR,
+        details: errors["a" /* ErrorDetails */].BUFFER_STALLED_ERROR,
+        fatal: false,
+        buffer: bufferLen
+      });
+    }
+  };
+
+  /**
+   * Attempts to fix buffer stalls by jumping over known gaps caused by partial fragments
+   * @param partial - The partial fragment found at the current time (where playback is stalling).
+   * @private
+   */
+
+
+  GapController.prototype._trySkipBufferHole = function _trySkipBufferHole(partial) {
+    var hls = this.hls,
+        media = this.media;
+
+    var currentTime = media.currentTime;
+    var lastEndTime = 0;
+    // Check if currentTime is between unbuffered regions of partial fragments
+    for (var i = 0; i < media.buffered.length; i++) {
+      var startTime = media.buffered.start(i);
+      if (currentTime >= lastEndTime && currentTime < startTime) {
+        media.currentTime = Math.max(startTime, media.currentTime + 0.1);
+        logger["b" /* logger */].warn('skipping hole, adjusting currentTime from ' + currentTime + ' to ' + media.currentTime);
+        this.stalled = null;
+        hls.trigger(events["a" /* default */].ERROR, {
+          type: errors["b" /* ErrorTypes */].MEDIA_ERROR,
+          details: errors["a" /* ErrorDetails */].BUFFER_SEEK_OVER_HOLE,
+          fatal: false,
+          reason: 'fragment loaded with buffer holes, seeking from ' + currentTime + ' to ' + media.currentTime,
+          frag: partial
+        });
+        return;
+      }
+      lastEndTime = media.buffered.end(i);
+    }
+  };
+
+  /**
+   * Attempts to fix buffer stalls by advancing the mediaElement's current time by a small amount.
+   * @private
+   */
+
+
+  GapController.prototype._tryNudgeBuffer = function _tryNudgeBuffer() {
+    var config = this.config,
+        hls = this.hls,
+        media = this.media;
+
+    var currentTime = media.currentTime;
+    var nudgeRetry = (this.nudgeRetry || 0) + 1;
+    this.nudgeRetry = nudgeRetry;
+
+    if (nudgeRetry < config.nudgeMaxRetry) {
+      var targetTime = currentTime + nudgeRetry * config.nudgeOffset;
+      logger["b" /* logger */].log('adjust currentTime from ' + currentTime + ' to ' + targetTime);
+      // playback stalled in buffered area ... let's nudge currentTime to try to overcome this
+      media.currentTime = targetTime;
+      hls.trigger(events["a" /* default */].ERROR, {
+        type: errors["b" /* ErrorTypes */].MEDIA_ERROR,
+        details: errors["a" /* ErrorDetails */].BUFFER_NUDGE_ON_STALL,
+        fatal: false
+      });
+    } else {
+      logger["b" /* logger */].error('still stuck in high buffer @' + currentTime + ' after ' + config.nudgeMaxRetry + ', raise fatal error');
+      hls.trigger(events["a" /* default */].ERROR, {
+        type: errors["b" /* ErrorTypes */].MEDIA_ERROR,
+        details: errors["a" /* ErrorDetails */].BUFFER_STALLED_ERROR,
+        fatal: true
+      });
+    }
+  };
+
+  return GapController;
+}();
+
+/* harmony default export */ var gap_controller = (gap_controller_GapController);
 // CONCATENATED MODULE: ./src/controller/stream-controller.js
 var stream_controller__createClass = function () { function defineProperties(target, props) { for (var i = 0; i < props.length; i++) { var descriptor = props[i]; descriptor.enumerable = descriptor.enumerable || false; descriptor.configurable = true; if ("value" in descriptor) descriptor.writable = true; Object.defineProperty(target, descriptor.key, descriptor); } } return function (Constructor, protoProps, staticProps) { if (protoProps) defineProperties(Constructor.prototype, protoProps); if (staticProps) defineProperties(Constructor, staticProps); return Constructor; }; }();
 
@@ -8798,6 +8999,7 @@ function stream_controller__inherits(subClass, superClass) { if (typeof superCla
 /*
  * Stream Controller
 */
+
 
 
 
@@ -8841,6 +9043,7 @@ var stream_controller_StreamController = function (_TaskLoop) {
     _this.audioCodecSwap = false;
     _this._state = State.STOPPED;
     _this.stallReported = false;
+    _this.gapController = null;
     return _this;
   }
 
@@ -9482,6 +9685,8 @@ var stream_controller_StreamController = function (_TaskLoop) {
     if (this.levels && config.autoStartLoad) {
       this.hls.startLoad(config.startPosition);
     }
+
+    this.gapController = new gap_controller(config, media, this.fragmentTracker, this.hls);
   };
 
   StreamController.prototype.onMediaDetaching = function onMediaDetaching() {
@@ -10121,16 +10326,13 @@ var stream_controller_StreamController = function (_TaskLoop) {
 
 
   StreamController.prototype._checkBuffer = function _checkBuffer() {
-    var config = this.config,
-        media = this.media;
+    var media = this.media;
 
-    var stallDebounceInterval = 1000;
     if (!media || media.readyState === 0) {
       // Exit early if we don't have media or if the media hasn't bufferd anything yet (readyState 0)
       return;
     }
 
-    var currentTime = media.currentTime;
     var mediaBuffer = this.mediaBuffer ? this.mediaBuffer : media;
     var buffered = mediaBuffer.buffered;
 
@@ -10140,34 +10342,7 @@ var stream_controller_StreamController = function (_TaskLoop) {
     } else if (this.immediateSwitch) {
       this.immediateLevelSwitchEnd();
     } else {
-      var expectedPlaying = !(media.paused && media.readyState > 1 || // not playing when media is paused and sufficiently buffered
-      media.ended || // not playing when media is ended
-      media.buffered.length === 0); // not playing if nothing buffered
-      var tnow = window.performance.now();
-
-      if (currentTime !== this.lastCurrentTime) {
-        // The playhead is now moving, but was previously stalled
-        if (this.stallReported) {
-          logger["b" /* logger */].warn('playback not stuck anymore @' + currentTime + ', after ' + Math.round(tnow - this.stalled) + 'ms');
-          this.stallReported = false;
-        }
-        this.stalled = null;
-        this.nudgeRetry = 0;
-      } else if (expectedPlaying) {
-        // The playhead isn't moving but it should be
-        // Allow some slack time to for small stalls to resolve themselves
-        var stalledDuration = tnow - this.stalled;
-        var bufferInfo = BufferHelper.bufferInfo(media, currentTime, config.maxBufferHole);
-        if (!this.stalled) {
-          this.stalled = tnow;
-          return;
-        } else if (stalledDuration >= stallDebounceInterval) {
-          // Report stalling after trying to fix
-          this._reportStall(bufferInfo.len);
-        }
-
-        this._tryFixBufferStall(bufferInfo, stalledDuration);
-      }
+      this.gapController.poll(this.lastCurrentTime, buffered);
     }
   };
 
@@ -10204,130 +10379,6 @@ var stream_controller_StreamController = function (_TaskLoop) {
   StreamController.prototype.computeLivePosition = function computeLivePosition(sliding, levelDetails) {
     var targetLatency = this.config.liveSyncDuration !== undefined ? this.config.liveSyncDuration : this.config.liveSyncDurationCount * levelDetails.targetduration;
     return sliding + Math.max(0, levelDetails.totalduration - targetLatency);
-  };
-
-  /**
-   * Detects and attempts to fix known buffer stalling issues.
-   * @param bufferInfo - The properties of the current buffer.
-   * @param stalledDuration - The amount of time Hls.js has been stalling for.
-   * @private
-   */
-
-
-  StreamController.prototype._tryFixBufferStall = function _tryFixBufferStall(bufferInfo, stalledDuration) {
-    var config = this.config,
-        media = this.media;
-
-    var currentTime = media.currentTime;
-    var jumpThreshold = 0.5; // tolerance needed as some browsers stalls playback before reaching buffered range end
-
-    var partial = this.fragmentTracker.getPartialFragment(currentTime);
-    if (partial) {
-      // Try to skip over the buffer hole caused by a partial fragment
-      // This method isn't limited by the size of the gap between buffered ranges
-      this._trySkipBufferHole(partial);
-    }
-
-    if (bufferInfo.len > jumpThreshold && stalledDuration > config.highBufferWatchdogPeriod * 1000) {
-      // Try to nudge currentTime over a buffer hole if we've been stalling for the configured amount of seconds
-      // We only try to jump the hole if it's under the configured size
-      // Reset stalled so to rearm watchdog timer
-      this.stalled = null;
-      this._tryNudgeBuffer();
-    }
-  };
-
-  /**
-   * Triggers a BUFFER_STALLED_ERROR event, but only once per stall period.
-   * @param bufferLen - The playhead distance from the end of the current buffer segment.
-   * @private
-   */
-
-
-  StreamController.prototype._reportStall = function _reportStall(bufferLen) {
-    var hls = this.hls,
-        media = this.media,
-        stallReported = this.stallReported;
-
-    if (!stallReported) {
-      // Report stalled error once
-      this.stallReported = true;
-      logger["b" /* logger */].warn('Playback stalling at @' + media.currentTime + ' due to low buffer');
-      hls.trigger(events["a" /* default */].ERROR, {
-        type: errors["b" /* ErrorTypes */].MEDIA_ERROR,
-        details: errors["a" /* ErrorDetails */].BUFFER_STALLED_ERROR,
-        fatal: false,
-        buffer: bufferLen
-      });
-    }
-  };
-
-  /**
-   * Attempts to fix buffer stalls by jumping over known gaps caused by partial fragments
-   * @param partial - The partial fragment found at the current time (where playback is stalling).
-   * @private
-   */
-
-
-  StreamController.prototype._trySkipBufferHole = function _trySkipBufferHole(partial) {
-    var hls = this.hls,
-        media = this.media;
-
-    var currentTime = media.currentTime;
-    var lastEndTime = 0;
-    // Check if currentTime is between unbuffered regions of partial fragments
-    for (var i = 0; i < media.buffered.length; i++) {
-      var startTime = media.buffered.start(i);
-      if (currentTime >= lastEndTime && currentTime < startTime) {
-        media.currentTime = Math.max(startTime, media.currentTime + 0.1);
-        logger["b" /* logger */].warn('skipping hole, adjusting currentTime from ' + currentTime + ' to ' + media.currentTime);
-        this.stalled = null;
-        hls.trigger(events["a" /* default */].ERROR, {
-          type: errors["b" /* ErrorTypes */].MEDIA_ERROR,
-          details: errors["a" /* ErrorDetails */].BUFFER_SEEK_OVER_HOLE,
-          fatal: false,
-          reason: 'fragment loaded with buffer holes, seeking from ' + currentTime + ' to ' + media.currentTime,
-          frag: partial
-        });
-        return;
-      }
-      lastEndTime = media.buffered.end(i);
-    }
-  };
-
-  /**
-   * Attempts to fix buffer stalls by advancing the mediaElement's current time by a small amount.
-   * @private
-   */
-
-
-  StreamController.prototype._tryNudgeBuffer = function _tryNudgeBuffer() {
-    var config = this.config,
-        hls = this.hls,
-        media = this.media;
-
-    var currentTime = media.currentTime;
-    var nudgeRetry = (this.nudgeRetry || 0) + 1;
-    this.nudgeRetry = nudgeRetry;
-
-    if (nudgeRetry < config.nudgeMaxRetry) {
-      var targetTime = currentTime + nudgeRetry * config.nudgeOffset;
-      logger["b" /* logger */].log('adjust currentTime from ' + currentTime + ' to ' + targetTime);
-      // playback stalled in buffered area ... let's nudge currentTime to try to overcome this
-      media.currentTime = targetTime;
-      hls.trigger(events["a" /* default */].ERROR, {
-        type: errors["b" /* ErrorTypes */].MEDIA_ERROR,
-        details: errors["a" /* ErrorDetails */].BUFFER_NUDGE_ON_STALL,
-        fatal: false
-      });
-    } else {
-      logger["b" /* logger */].error('still stuck in high buffer @' + currentTime + ' after ' + config.nudgeMaxRetry + ', raise fatal error');
-      hls.trigger(events["a" /* default */].ERROR, {
-        type: errors["b" /* ErrorTypes */].MEDIA_ERROR,
-        details: errors["a" /* ErrorDetails */].BUFFER_STALLED_ERROR,
-        fatal: true
-      });
-    }
   };
 
   /**
@@ -11397,8 +11448,13 @@ var abr_controller_AbrController = function (_EventHandler) {
 
   AbrController.prototype._findBestLevel = function _findBestLevel(currentLevel, currentFragDuration, currentBw, minAutoLevel, maxAutoLevel, maxFetchDuration, bwFactor, bwUpFactor, levels) {
     for (var i = maxAutoLevel; i >= minAutoLevel; i--) {
-      var levelInfo = levels[i],
-          levelDetails = levelInfo.details,
+      var levelInfo = levels[i];
+
+      if (!levelInfo) {
+        continue;
+      }
+
+      var levelDetails = levelInfo.details,
           avgDuration = levelDetails ? levelDetails.totalduration / levelDetails.fragments.length : currentFragDuration,
           live = levelDetails ? levelDetails.live : false,
           adjustedbw = void 0;
@@ -12158,7 +12214,7 @@ var cap_level_controller_CapLevelController = function (_EventHandler) {
   function CapLevelController(hls) {
     cap_level_controller__classCallCheck(this, CapLevelController);
 
-    var _this = cap_level_controller__possibleConstructorReturn(this, _EventHandler.call(this, hls, events["a" /* default */].FPS_DROP_LEVEL_CAPPING, events["a" /* default */].MEDIA_ATTACHING, events["a" /* default */].MANIFEST_PARSED, events["a" /* default */].BUFFER_CODECS));
+    var _this = cap_level_controller__possibleConstructorReturn(this, _EventHandler.call(this, hls, events["a" /* default */].FPS_DROP_LEVEL_CAPPING, events["a" /* default */].MEDIA_ATTACHING, events["a" /* default */].MANIFEST_PARSED, events["a" /* default */].BUFFER_CODECS, events["a" /* default */].MEDIA_DETACHING));
 
     _this.autoLevelCapping = Number.POSITIVE_INFINITY;
     _this.firstLevel = null;
@@ -12212,6 +12268,10 @@ var cap_level_controller_CapLevelController = function (_EventHandler) {
 
   CapLevelController.prototype.onLevelsUpdated = function onLevelsUpdated(data) {
     this.levels = data.levels;
+  };
+
+  CapLevelController.prototype.onMediaDetaching = function onMediaDetaching() {
+    this._stopCapping();
   };
 
   CapLevelController.prototype.detectPlayerSize = function detectPlayerSize() {
@@ -12438,184 +12498,102 @@ var fps_controller_FPSController = function (_EventHandler) {
 }(event_handler);
 
 /* harmony default export */ var fps_controller = (fps_controller_FPSController);
-// CONCATENATED MODULE: ./src/utils/xhr-loader.js
-function xhr_loader__classCallCheck(instance, Constructor) { if (!(instance instanceof Constructor)) { throw new TypeError("Cannot call a class as a function"); } }
+// CONCATENATED MODULE: ./src/utils/fetch-loader.js
+function fetch_loader__classCallCheck(instance, Constructor) { if (!(instance instanceof Constructor)) { throw new TypeError("Cannot call a class as a function"); } }
 
 /**
- * XHR based logger
+ * Fetch based loader
+ * timeout / abort / onprogress not supported for now
+ * timeout / abort : some ideas here : https://github.com/whatwg/fetch/issues/20#issuecomment-196113354
+ * but still it is not bullet proof as it fails to avoid data waste....
 */
 
+var fetch_loader__window = window,
+    Request = fetch_loader__window.Request,
+    Headers = fetch_loader__window.Headers,
+    fetch = fetch_loader__window.fetch,
+    fetch_loader_performance = fetch_loader__window.performance;
 
+var FetchLoader = function () {
+  function FetchLoader(config) {
+    fetch_loader__classCallCheck(this, FetchLoader);
 
-var xhr_loader__window = window,
-    xhr_loader_performance = xhr_loader__window.performance,
-    XMLHttpRequest = xhr_loader__window.XMLHttpRequest;
-
-var xhr_loader_XhrLoader = function () {
-  function XhrLoader(config) {
-    xhr_loader__classCallCheck(this, XhrLoader);
-
-    if (config && config.xhrSetup) {
-      this.xhrSetup = config.xhrSetup;
-    }
+    this.fetchSetup = config.fetchSetup;
   }
 
-  XhrLoader.prototype.destroy = function destroy() {
-    this.abort();
-    this.loader = null;
-  };
+  FetchLoader.prototype.destroy = function destroy() {};
 
-  XhrLoader.prototype.abort = function abort() {
-    var loader = this.loader;
-    if (loader && loader.readyState !== 4) {
-      this.stats.aborted = true;
-      loader.abort();
-    }
+  FetchLoader.prototype.abort = function abort() {};
 
-    window.clearTimeout(this.requestTimeout);
-    this.requestTimeout = null;
-    window.clearTimeout(this.retryTimeout);
-    this.retryTimeout = null;
-  };
+  FetchLoader.prototype.load = function load(context, config, callbacks) {
+    var stats = {
+      trequest: fetch_loader_performance.now(),
+      retry: 0
+    };
 
-  XhrLoader.prototype.load = function load(context, config, callbacks) {
-    this.context = context;
-    this.config = config;
-    this.callbacks = callbacks;
-    this.stats = { trequest: xhr_loader_performance.now(), retry: 0 };
-    this.retryDelay = config.retryDelay;
-    this.loadInternal();
-  };
+    var targetURL = context.url;
+    var request = void 0;
 
-  XhrLoader.prototype.loadInternal = function loadInternal() {
-    var xhr = void 0,
-        context = this.context;
-    xhr = this.loader = new XMLHttpRequest();
+    var initParams = {
+      method: 'GET',
+      mode: 'cors',
+      credentials: 'same-origin'
+    };
 
-    var stats = this.stats;
-    stats.tfirst = 0;
-    stats.loaded = 0;
-    var xhrSetup = this.xhrSetup;
-
-    try {
-      if (xhrSetup) {
-        try {
-          xhrSetup(xhr, context.url);
-        } catch (e) {
-          // fix xhrSetup: (xhr, url) => {xhr.setRequestHeader("Content-Language", "test");}
-          // not working, as xhr.setRequestHeader expects xhr.readyState === OPEN
-          xhr.open('GET', context.url, true);
-          xhrSetup(xhr, context.url);
-        }
-      }
-      if (!xhr.readyState) {
-        xhr.open('GET', context.url, true);
-      }
-    } catch (e) {
-      // IE11 throws an exception on xhr.open if attempting to access an HTTP resource over HTTPS
-      this.callbacks.onError({ code: xhr.status, text: e.message }, context, xhr);
-      return;
-    }
+    var headersObj = {};
 
     if (context.rangeEnd) {
-      xhr.setRequestHeader('Range', 'bytes=' + context.rangeStart + '-' + (context.rangeEnd - 1));
+      headersObj['Range'] = 'bytes=' + context.rangeStart + '-' + String(context.rangeEnd - 1);
+    } /* jshint ignore:line */
+
+    initParams.headers = new Headers(headersObj);
+
+    if (this.fetchSetup) {
+      request = this.fetchSetup(context, initParams);
+    } else {
+      request = new Request(context.url, initParams);
     }
 
-    xhr.onreadystatechange = this.readystatechange.bind(this);
-    xhr.onprogress = this.loadprogress.bind(this);
-    xhr.responseType = context.responseType;
+    var fetchPromise = fetch(request, initParams);
 
-    // setup timeout before we perform request
-    this.requestTimeout = window.setTimeout(this.loadtimeout.bind(this), this.config.timeout);
-    xhr.send();
-  };
-
-  XhrLoader.prototype.readystatechange = function readystatechange(event) {
-    var xhr = event.currentTarget,
-        readyState = xhr.readyState,
-        stats = this.stats,
-        context = this.context,
-        config = this.config;
-
-    // don't proceed if xhr has been aborted
-    if (stats.aborted) {
-      return;
-    }
-
-    // >= HEADERS_RECEIVED
-    if (readyState >= 2) {
-      // clear xhr timeout and rearm it if readyState less than 4
-      window.clearTimeout(this.requestTimeout);
-      if (stats.tfirst === 0) {
-        stats.tfirst = Math.max(xhr_loader_performance.now(), stats.trequest);
-      }
-
-      if (readyState === 4) {
-        var status = xhr.status;
-        // http status between 200 to 299 are all successful
-        if (status >= 200 && status < 300) {
-          stats.tload = Math.max(stats.tfirst, xhr_loader_performance.now());
-          var data = void 0,
-              len = void 0;
-          if (context.responseType === 'arraybuffer') {
-            data = xhr.response;
-            len = data.byteLength;
-          } else {
-            data = xhr.responseText;
-            len = data.length;
-          }
-          stats.loaded = stats.total = len;
-          var response = { url: xhr.responseURL, data: data };
-          this.callbacks.onSuccess(response, stats, context, xhr);
+    // process fetchPromise
+    var responsePromise = fetchPromise.then(function (response) {
+      if (response.ok) {
+        stats.tfirst = Math.max(stats.trequest, fetch_loader_performance.now());
+        targetURL = response.url;
+        if (context.responseType === 'arraybuffer') {
+          return response.arrayBuffer();
         } else {
-          // if max nb of retries reached or if http status between 400 and 499 (such error cannot be recovered, retrying is useless), return error
-          if (stats.retry >= config.maxRetry || status >= 400 && status < 499) {
-            logger["b" /* logger */].error(status + ' while loading ' + context.url);
-            this.callbacks.onError({ code: status, text: xhr.statusText }, context, xhr);
-          } else {
-            // retry
-            logger["b" /* logger */].warn(status + ' while loading ' + context.url + ', retrying in ' + this.retryDelay + '...');
-            // aborts and resets internal state
-            this.destroy();
-            // schedule retry
-            this.retryTimeout = window.setTimeout(this.loadInternal.bind(this), this.retryDelay);
-            // set exponential backoff
-            this.retryDelay = Math.min(2 * this.retryDelay, config.maxRetryDelay);
-            stats.retry++;
-          }
+          return response.text();
         }
       } else {
-        // readyState >= 2 AND readyState !==4 (readyState = HEADERS_RECEIVED || LOADING) rearm timeout as xhr not finished yet
-        this.requestTimeout = window.setTimeout(this.loadtimeout.bind(this), config.timeout);
+        callbacks.onError({ text: 'fetch, bad network response' }, context);
       }
-    }
+    }).catch(function (error) {
+      callbacks.onError({ text: error.message }, context);
+    });
+    // process response Promise
+    responsePromise.then(function (responseData) {
+      if (responseData) {
+        stats.tload = Math.max(stats.tfirst, fetch_loader_performance.now());
+        var len = void 0;
+        if (typeof responseData === 'string') {
+          len = responseData.length;
+        } else {
+          len = responseData.byteLength;
+        }
+
+        stats.loaded = stats.total = len;
+        var response = { url: targetURL, data: responseData };
+        callbacks.onSuccess(response, stats, context);
+      }
+    });
   };
 
-  XhrLoader.prototype.loadtimeout = function loadtimeout() {
-    logger["b" /* logger */].warn('timeout while loading ' + this.context.url);
-    this.callbacks.onTimeout(this.stats, this.context, null);
-  };
-
-  XhrLoader.prototype.loadprogress = function loadprogress(event) {
-    var xhr = event.currentTarget,
-        stats = this.stats;
-
-    stats.loaded = event.loaded;
-    if (event.lengthComputable) {
-      stats.total = event.total;
-    }
-
-    var onProgress = this.callbacks.onProgress;
-    if (onProgress) {
-      // third arg is to provide on progress data
-      onProgress(stats, this.context, null, xhr);
-    }
-  };
-
-  return XhrLoader;
+  return FetchLoader;
 }();
 
-/* harmony default export */ var xhr_loader = (xhr_loader_XhrLoader);
+/* harmony default export */ var fetch_loader = (FetchLoader);
 // EXTERNAL MODULE: ./src/empty.js
 var empty = __webpack_require__(3);
 var empty_default = /*#__PURE__*/__webpack_require__.n(empty);
@@ -12639,8 +12617,8 @@ var requestMediaKeySystemAccess = function () {
 
 
 
+//import XhrLoader from './utils/xhr-loader';
 
-// import FetchLoader from './utils/fetch-loader';
 
 
 
@@ -12695,8 +12673,8 @@ var hlsDefaultConfig = {
   fpsDroppedMonitoringPeriod: 5000, // used by fps-controller
   fpsDroppedMonitoringThreshold: 0.2, // used by fps-controller
   appendErrorMaxRetry: 3, // used by buffer-controller
-  loader: xhr_loader,
-  // loader: FetchLoader,
+  //loader: XhrLoader,
+  loader: fetch_loader,
   fLoader: undefined, // used by fragment-loader
   pLoader: undefined, // used by playlist-loader
   xhrSetup: undefined, // used by xhr-loader

@@ -6,8 +6,8 @@ import AbrController from './controller/abr-controller';
 import BufferController from './controller/buffer-controller';
 import CapLevelController from './controller/cap-level-controller';
 import FPSController from './controller/fps-controller';
-import XhrLoader from './utils/xhr-loader';
-// import FetchLoader from './utils/fetch-loader';
+// import XhrLoader from './utils/xhr-loader';
+import FetchLoader from './utils/fetch-loader';
 
 import AudioTrackController from './controller/audio-track-controller';
 import AudioStreamController from './controller/audio-stream-controller';
@@ -62,8 +62,8 @@ export var hlsDefaultConfig = {
   fpsDroppedMonitoringPeriod: 5000, // used by fps-controller
   fpsDroppedMonitoringThreshold: 0.2, // used by fps-controller
   appendErrorMaxRetry: 3, // used by buffer-controller
-  loader: XhrLoader,
-  // loader: FetchLoader,
+  // loader: XhrLoader,
+  loader: FetchLoader,
   fLoader: undefined, // used by fragment-loader
   pLoader: undefined, // used by playlist-loader
   xhrSetup: undefined, // used by xhr-loader
